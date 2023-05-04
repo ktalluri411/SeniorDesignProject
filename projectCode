@@ -1,0 +1,498 @@
+#include <Thread.h>
+#include "esp_timer.h"
+#include "SCD30.h"
+#include "SCD31.h"
+#include <LiquidCrystal_I2C.h>
+ 
+
+#define GPIO_RELAY_PIN        27 // ESP32 GIOP27 - connects to the IN pin of relay
+#define GPIO_PWM_PIN          15 // GPIO to send PWM for Fan
+#define GPIO_FRONT_PM25RX     16 // Serial port RX GPIO To front sensor PM2.5 TX
+#define GPIO_FRONT_PM25TX     17 // Serial port TX GPIO To front sensor PM2.5 RX
+#define GPIO_BACK_PM25RX      18 // Serial port RX GPIO To back sensor PM2.5 TX
+#define GPIO_BACK_PM25TX      19 // Serial port TX GPIO To back sensor PM2.5 RX
+ 
+#define GPIO_BACK_CO2SCL      14
+#define GPIO_BACK_CO2SDA      12
+ 
+#define FRONT_LCD_I2C_ADDR    0x27
+#define BACK_LCD_I2C_ADDR     0x26
+#define FRONT_SCD30_I2C_ADDR  0x61
+ 
+#define BACK_SCD30_I2C_ADDR   0x62
+#if 0
+// Define particulate matter ranges for fan speed
+#define PM25_MODERATE       250
+#define PM25_UNHEALTHY      500
+#define PM25_VERY_UNHEALTHY 750
+#define PM25_HAZARDOUS      1000
+ 
+
+#define PM10_MODERATE       500
+#define PM10_UNHEALTHY      800
+#define PM10_VERY_UNHEALTHY 1200
+#define PM10_HAZARDOUS      1600
+ 
+#define CO2_MODERATE        1400
+#define CO2_UNHEALTHY       1700
+#define CO2_VERY_UNHEALTHY  1900
+#define CO2_HAZARDOUS       2200
+#endif
+ 
+// Fan Speed in percentage
+#define FAN_LOWEST_SPEED   5
+#define FAN_LOW_SPEED     33
+#define FAN_MEDIUM_SPEED  66
+#define FAN_HIGH_SPEED    100
+#define FAN_FREQUENCY     30000
+ 
+// Test values
+#define PM25_MODERATE       5
+#define PM25_UNHEALTHY      100
+#define PM25_VERY_UNHEALTHY 400
+#define PM25_HAZARDOUS      1000
+ 
+#define PM10_MODERATE       5
+#define PM10_UNHEALTHY      100
+#define PM10_VERY_UNHEALTHY 200
+#define PM10_HAZARDOUS      500
+ 
+#define CO2_MODERATE        700
+#define CO2_UNHEALTHY       800
+#define CO2_VERY_UNHEALTHY  4000
+#define CO2_HAZARDOUS       7000
+ 
+
+// PM2.5 sensor Data structures
+struct pms5003data {
+  uint16_t framelen;
+  uint16_t pm10_standard, pm25_standard, pm100_standard;
+  uint16_t pm10_env, pm25_env, pm100_env;
+  uint16_t particles_03um, particles_05um, particles_10um, particles_25um, particles_50um, particles_100um;
+  uint16_t unused;
+  uint16_t checksum;
+};
+ 
+
+struct pms5003data frontpm25_data, backpm25_data, temp, temp1;
+ 
+// Fan related data structures
+int pwmChannel  = 0;
+int resolution  = 8;
+int fan_current_speed = FAN_LOWEST_SPEED;
+int duty_cycle = 0;
+ 
+
+// LCD Data structures
+int lcdColumns = 16;
+int lcdRows = 2;
+LiquidCrystal_I2C front_lcd(FRONT_LCD_I2C_ADDR, lcdColumns, lcdRows);
+LiquidCrystal_I2C back_lcd(BACK_LCD_I2C_ADDR, lcdColumns, lcdRows);
+ 
+
+// CO2 Data structures
+float front_co2_result[3] = {0};
+float back_co2_result[3] = {0};
+SCD30 front_scd30(FRONT_SCD30_I2C_ADDR);
+//SCD31 back_scd31(BACK_SCD30_I2C_ADDR);
+int front_co2_whole = 0;
+int front_co2_decimal = 0;
+int back_co2_whole = 0;
+int back_co2_decimal = 0;
+ 
+//global variables for old/new sensor values
+uint16_t old_front_pm25 = 0;
+ 
+int old_back_pm25 = 0;
+int new_back_pm25 = 0;
+int old_front_co2 = 0;
+int new_front_co2 = 0;
+ 
+
+void fanRampDownSpeed(int pin, int from_speed, int to_speed, int speed_ms)
+{
+ 
+    for (int i= from_speed; i>=to_speed; i--) {
+      duty_cycle = i*2.55;
+      analogWrite(pin, duty_cycle);
+      Serial.print("Down"); Serial.println(duty_cycle);
+      delay(speed_ms/100);
+    }
+ }
+ 
+ void fanRampUpSpeed(int pin, int from_speed, int to_speed, int speed_ms)
+ {
+    for (int i=from_speed; i<=to_speed; ++i) {
+      duty_cycle = i*2.55;
+      analogWrite(pin, duty_cycle);
+      Serial.print("Up"); Serial.println(duty_cycle);
+      delay(speed_ms/100);
+    }
+}
+ 
+void setFanSpeed()
+{
+  Serial.println("Fan ");
+  Serial.println(frontpm25_data.pm25_standard);
+  Serial.println(frontpm25_data.pm10_standard);
+  Serial.println(front_co2_whole);
+  Serial.println("==========");
+  if ((frontpm25_data.pm25_standard < PM25_MODERATE) &&
+     (frontpm25_data.pm10_standard < PM10_MODERATE) &&
+     (front_co2_whole < CO2_MODERATE)) {
+     // Good condition fan speed to lowest
+      Serial.println("Lowest");
+      if (fan_current_speed != FAN_LOWEST_SPEED) {
+          fanRampDownSpeed(GPIO_PWM_PIN, fan_current_speed, FAN_LOWEST_SPEED, 100);
+      } else {
+        duty_cycle = FAN_LOWEST_SPEED * 2.55;
+        analogWrite(GPIO_PWM_PIN, duty_cycle);
+        Serial.println("Initial");
+      }
+      fan_current_speed = FAN_LOWEST_SPEED;
+  } else if (((frontpm25_data.pm25_standard > PM25_MODERATE) &&
+      (frontpm25_data.pm25_standard < PM25_UNHEALTHY)) ||
+      ((frontpm25_data.pm10_standard > PM10_MODERATE) &&
+      (frontpm25_data.pm10_standard < PM10_UNHEALTHY)) ||
+      ((front_co2_whole > CO2_MODERATE) &&
+      (front_co2_whole < CO2_UNHEALTHY))) {
+ 
+         // PM2.5 or PM10 is in Moderate range
+         // Determine ramp up or ramp down
+     
+      Serial.println("Low");
+      if (fan_current_speed > FAN_LOW_SPEED) {
+         fanRampDownSpeed(GPIO_PWM_PIN, fan_current_speed, FAN_LOW_SPEED, 100);
+      } else if (fan_current_speed < FAN_LOW_SPEED) {
+         fanRampUpSpeed(GPIO_PWM_PIN, fan_current_speed, FAN_LOW_SPEED, 100);
+      }
+      fan_current_speed = FAN_LOW_SPEED;
+    } else if (((frontpm25_data.pm25_standard > PM25_UNHEALTHY) &&
+          (frontpm25_data.pm25_standard < PM25_VERY_UNHEALTHY)) ||
+         ((frontpm25_data.pm10_standard > PM10_UNHEALTHY) &&
+          (frontpm25_data.pm10_standard < PM10_VERY_UNHEALTHY)) ||
+         ((front_co2_whole > CO2_UNHEALTHY) &&
+          (front_co2_whole < CO2_VERY_UNHEALTHY))) {
+         // PM2.5 or PM10 is in Very Unhealthy range
+         // Determine ramp up or ramp down
+       
+         Serial.println("Medium");
+         if (fan_current_speed > FAN_MEDIUM_SPEED) {
+             fanRampDownSpeed(GPIO_PWM_PIN, fan_current_speed, FAN_MEDIUM_SPEED, 100);
+         } else if (fan_current_speed < FAN_MEDIUM_SPEED) {
+             fanRampUpSpeed(GPIO_PWM_PIN, fan_current_speed, FAN_MEDIUM_SPEED, 100);
+         }
+         fan_current_speed = FAN_MEDIUM_SPEED;
+    } else if ((frontpm25_data.pm25_standard > PM25_VERY_UNHEALTHY) ||
+         (frontpm25_data.pm10_standard > PM10_VERY_UNHEALTHY) ||
+         (front_co2_whole > CO2_VERY_UNHEALTHY)) {
+         // PM2.5 or PM10 is in Hazardous range
+         // Determine ramp up or ramp down
+ 
+          Serial.println("High");
+ 
+         if (fan_current_speed > FAN_HIGH_SPEED) {
+             fanRampDownSpeed(GPIO_PWM_PIN, fan_current_speed, FAN_HIGH_SPEED, 100);
+         } else if (fan_current_speed < FAN_HIGH_SPEED) {
+             fanRampUpSpeed(GPIO_PWM_PIN, fan_current_speed, FAN_HIGH_SPEED, 100);
+         }
+         fan_current_speed = FAN_HIGH_SPEED;
+    }
+ 
+}
+ 
+void front_pm25_callback()
+{
+  uint8_t buffer[32];
+  uint16_t buffer_u16[15];
+  uint16_t sum = 0;
+ 
+  Serial.println("Front PM");
+  if (!Serial2.available()) {
+    return;
+  }
+ 
+  // Read a byte at a time until we get to the special '0x42' start-byte
+  if (Serial2.peek() != 0x42) {
+    Serial2.read();
+    return;
+  }
+ 
+  // Now read all 32 bytes
+  if (Serial2.available() < 32) {
+    return;
+  }
+ 
+  Serial2.readBytes(buffer, 32);
+  // get checksum ready
+  for (uint8_t i = 0; i < 30; i++) {
+    sum += buffer[i];
+  }
+ 
+ // The data comes in endian'd, this solves it so it works on all platforms
+ for (uint8_t i = 0; i < 15; i++) {
+   buffer_u16[i] = buffer[2 + i * 2 + 1];
+   buffer_u16[i] += (buffer[2 + i * 2] << 8);
+ }
+ 
+
+  // put it into a nice struct :)
+  memcpy((void *)&temp, (void *)buffer_u16, 30);
+  //memcpy((void *)&frontpm25_data, (void *)buffer_u16, 30);
+  //if (sum != frontpm25_data.checksum) {
+    if (sum != temp.checksum) {
+#if 0
+    Serial.print(frontpm25_data.framelen);
+    Serial.print(" ");
+    Serial.print(frontpm25_data.pm10_standard);
+    Serial.print(" ");
+    Serial.print(frontpm25_data.pm25_standard);
+    Serial.print(" ");
+    Serial.print(frontpm25_data.pm100_standard);
+    Serial.print(" ");
+    Serial.print(frontpm25_data.pm10_env);
+    Serial.print(" ");
+    Serial.print(frontpm25_data.pm25_env);
+    Serial.print(" ");
+    Serial.print(frontpm25_data.pm100_env);
+    Serial.print(" ");
+    Serial.print(frontpm25_data.particles_03um);
+    Serial.print(" ");
+    Serial.print(frontpm25_data.particles_05um);
+    Serial.print(" ");
+    Serial.print(frontpm25_data.particles_10um);
+    Serial.print(" ");
+    Serial.print(frontpm25_data.particles_25um);
+    Serial.print(" ");
+    Serial.print(frontpm25_data.particles_50um);
+    Serial.print(" ");
+    Serial.print(frontpm25_data.particles_100um);
+    Serial.print(" ");
+    Serial.print(sum);
+    Serial.print(" ");
+    Serial.println(frontpm25_data.checksum);
+#endif
+    Serial.println("Front PM25 data Checksum failure");
+    return; //front_pm25_callback();
+  }
+ 
+  memcpy((void *)&frontpm25_data, (void *)buffer_u16, 30);
+ 
+  //new_front_pm25 = frontpm25_data.pm25_standard; //after mempy of new data into struct, store for later comparison
+  // success!
+  return;
+}
+ 
+void back_pm25_callback()
+{
+  uint8_t buffer[32];
+  uint16_t buffer_u16[15];
+  uint16_t sum = 0;
+ 
+  Serial.println("Back PM");
+  if (!Serial1.available()) {
+    return;
+  }
+  // Read a byte at a time until we get to the special '0x42' start-byte
+  if (Serial1.peek() != 0x42) {
+    Serial1.read();
+    return;
+  }
+ 
+  // Now read all 32 bytes
+  if (Serial1.available() < 32) {
+    return;
+  }
+  Serial1.readBytes(buffer, 32);
+ 
+ // get checksum ready
+  for (uint8_t i = 0; i < 30; i++) {
+    sum += buffer[i];
+  }
+ 
+  // The data comes in endian'd, this solves it so it works on all platforms
+  for (uint8_t i = 0; i < 15; i++) {
+    buffer_u16[i] = buffer[2 + i * 2 + 1];
+    buffer_u16[i] += (buffer[2 + i * 2] << 8);
+  }
+ 
+  // put it into a nice struct :)
+  memcpy((void *)&temp1, (void *)buffer_u16, 30);
+  //memcpy((void *)&backpm25_data, (void *)buffer_u16, 30);
+  //if (sum != backpm25_data.checksum) {
+  if (sum != temp1.checksum) {
+    Serial.println("Back PM25 data Checksum failure");
+    return; //back_pm25_callback();
+  }
+  memcpy((void *)&backpm25_data, (void *)buffer_u16, 30);
+  // success!
+  return;
+}
+ 
+void front_lcd_callback()
+{
+ char buf_line1[16];
+ char buf_line2[16];
+ 
+ Serial.println("Front LCD");
+ front_lcd.clear();
+ front_lcd.setCursor(0, 0);
+ sprintf(buf_line1, "C:%4d.%02d F:%4d", front_co2_whole, front_co2_decimal, duty_cycle);
+ front_lcd.print(buf_line1);
+ front_lcd.setCursor(0,1);
+ sprintf(buf_line2, "PM:%4d %4d", frontpm25_data.pm25_standard, frontpm25_data.pm10_standard);
+ front_lcd.print(buf_line2);
+ }
+ 
+
+void back_lcd_callback()
+{
+  char buf_line1[16];
+  char buf_line2[16];
+ 
+  Serial.println("Back LCD");
+ 
+  back_lcd.clear();
+  back_lcd.setCursor(0, 0);
+  sprintf(buf_line1, "C:%4d.%02d", back_co2_whole, back_co2_decimal);
+  back_lcd.print(buf_line1);
+  back_lcd.setCursor(0, 1);
+  sprintf(buf_line2, "PM:%4d %4d", backpm25_data.pm25_standard, backpm25_data.pm10_standard);
+  back_lcd.print(buf_line2);
+}
+ 
+void front_co2_callback()
+{
+  int x;
+ 
+  Serial.println("Front CO2");
+  if (front_scd30.isAvailable()) {
+     front_scd30.getCarbonDioxideConcentration(front_co2_result);
+     front_co2_whole = front_co2_result[0];
+     x = front_co2_result[0] * 100;
+     front_co2_decimal = x % 100;
+  }
+}
+ 
+
+void back_co2_callback()
+{
+  int x;
+  Serial.println("Back CO2");
+  if (scd31.isAvailable()) {
+    scd31.getCarbonDioxideConcentration(back_co2_result);
+    back_co2_whole = back_co2_result[0];
+    x = back_co2_result[0] * 100;
+    back_co2_decimal = x % 100;
+  }
+}
+ 
+void printdata()
+{
+   String p=".";
+ 
+   Serial.println();
+ 
+   Serial.println("---------------------------------------");
+   Serial.println("Concentration Units (standard)");
+   Serial.print(" Front PM 2.5: ");
+   Serial.println(frontpm25_data.pm25_standard);  
+   Serial.print(" Front PM 10 : ");
+   Serial.println(frontpm25_data.pm10_standard);
+   Serial.println(" Concentration Units (environmental)");
+   Serial.print(" Front PM 2.5: ");
+   Serial.println(frontpm25_data.pm25_env);
+   Serial.print(" Front PM 10 : ");
+   Serial.println(frontpm25_data.pm10_env);
+ 
+   Serial.println("Concentration Units (standard)");
+   Serial.print(" Back PM 2.5: ");
+   Serial.println(backpm25_data.pm25_standard);
+   Serial.print("Back PM 10 : ");
+   Serial.println(backpm25_data.pm10_standard);
+   Serial.println(" Concentration Units (environmental)");
+   Serial.print(" Back PM 2.5: ");
+   Serial.println(backpm25_data.pm25_env);
+   Serial.print(" Back PM 10 : ");
+   Serial.println(backpm25_data.pm10_env);
+ 
+
+   Serial.print("Fan Speed: ");
+   Serial.print(fan_current_speed);
+   
+   Serial.print("Front CO2: ");
+   Serial.println(front_co2_result[0]);
+   Serial.println(front_co2_whole+p+front_co2_decimal);
+ 
+   Serial.print("Back CO2: ");
+   Serial.println(back_co2_result[0]);
+   Serial.println(back_co2_whole+p+back_co2_decimal);
+ 
+   Serial.print("Duty Cycle: ");
+   Serial.println(duty_cycle);
+   Serial.println("---------------------------------------");
+}
+ 
+
+void setup() {
+  // Set up Console for printing
+ 
+  Serial.begin(115200);
+ 
+  // Fan Inititialization
+  pinMode(GPIO_RELAY_PIN, OUTPUT);
+  digitalWrite(GPIO_RELAY_PIN, HIGH); // Power to relay
+ 
+  ledcAttachPin(GPIO_PWM_PIN, pwmChannel); // set up GPIO for PWM control
+  ledcSetup(pwmChannel, FAN_FREQUENCY, resolution);
+ 
+  // Front PM2.5 sensor UART connection
+  Serial2.begin(9600, SERIAL_8N1, GPIO_FRONT_PM25RX, GPIO_FRONT_PM25TX);
+ 
+  // Front CO2 Initialize the GadgetBle Library for
+  Wire.begin();
+  front_scd30.initialize();
+  front_scd30.setAutoSelfCalibration(1);
+ 
+  //Back CO2 initialize
+  Wire1.begin(GPIO_BACK_CO2SDA, GPIO_BACK_CO2SCL, 100000);
+  scd31.initialize();
+  scd31.setAutoSelfCalibration(1);
+ 
+  // back PM2.5 sensor UART connection
+  Serial1.begin(9600, SERIAL_8N1, GPIO_BACK_PM25RX, GPIO_BACK_PM25TX);
+ 
+  // LCD initialization
+  front_lcd.init();
+  back_lcd.init();
+ 
+  // turn on LCD backlight                    
+  front_lcd.backlight();
+  back_lcd.backlight();
+ 
+}
+ 
+
+void loop() {
+  Serial.println("START LOOP");
+ 
+  setFanSpeed();
+  front_pm25_callback();
+  //delay(1000);
+  front_co2_callback();
+  //delay(1000);
+  back_pm25_callback();
+  //delay(1000);
+  back_co2_callback();
+  //delay(1000);
+ 
+  front_lcd_callback();
+  back_lcd_callback();
+ 
+  setFanSpeed();
+ 
+  printdata();
+  //delay(1000);
+}
+
+
